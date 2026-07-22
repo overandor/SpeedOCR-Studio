@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "name": "speedocr-studio",
+  "public": true,
+  "cleanUrls": true,
+  "builds": [
+    {
+      "src": "website/**",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/website/$1"
+    }
+  ]
+}
