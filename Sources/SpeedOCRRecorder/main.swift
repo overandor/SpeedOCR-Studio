@@ -9,6 +9,7 @@ import CoreVideo
 import CoreGraphics
 import ImageIO
 import Combine
+import Network
 
 // MARK: - Data Models
 
@@ -30,6 +31,7 @@ struct OCREvent: Codable, Identifiable {
     let visualChange: Double
     let text: String
     let boxes: [OCRBox]
+    var passType: String = "live"
 }
 
 struct RecordingOptions {
@@ -41,6 +43,58 @@ struct RecordingOptions {
     var changeThreshold: Double = 0.018
     var forceOCRInterval: Double = 1.25
     var region: CGRect? = nil
+    var enableTrajectorySelection: Bool = true
+}
+
+// MARK: - Trajectory Frame Candidate Buffer
+
+final class FrameCandidate: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let pts: CMTime
+    let elapsed: Double
+    let ptsSeconds: Double
+    let wallClock: String
+    let visualChange: Double
+    let sharpnessScore: Double
+
+    init(pixelBuffer: CVPixelBuffer, pts: CMTime, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, sharpnessScore: Double) {
+        self.pixelBuffer = pixelBuffer
+        self.pts = pts
+        self.elapsed = elapsed
+        self.ptsSeconds = ptsSeconds
+        self.wallClock = wallClock
+        self.visualChange = visualChange
+        self.sharpnessScore = sharpnessScore
+    }
+}
+
+final class TrajectoryTracker: @unchecked Sendable {
+    private var candidateBuffer: [FrameCandidate] = []
+    private var isTrackingMotion = false
+    private var previousChange: Double = 0
+
+    func processFrame(candidate: FrameCandidate, threshold: Double) -> FrameCandidate? {
+        let change = candidate.visualChange
+
+        if change >= threshold {
+            candidateBuffer.append(candidate)
+            isTrackingMotion = true
+            previousChange = change
+            if candidateBuffer.count > 10 {
+                candidateBuffer.removeFirst()
+            }
+            return nil
+        } else if isTrackingMotion {
+            // Motion just stabilized! Pick the candidate with highest visual change & stability
+            isTrackingMotion = false
+            let bestCandidate = candidateBuffer.max(by: { $0.sharpnessScore < $1.sharpnessScore }) ?? candidate
+            candidateBuffer.removeAll()
+            return bestCandidate
+        }
+
+        previousChange = change
+        return nil
+    }
 }
 
 // MARK: - Sidecar File Writer
@@ -221,6 +275,7 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
     private var sidecar: SidecarWriter?
+    private var apiServer: LocalAPIServer?
 
     private var writerStarted = false
     private var firstPTS: CMTime?
@@ -231,11 +286,14 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
     private var lastAcceptedNormalizedText = ""
 
     private let changeDetector = FrameChangeDetector()
+    private let trajectoryTracker = TrajectoryTracker()
     private let dateFormatter = ISO8601DateFormatter()
 
     override init() {
         super.init()
         dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        apiServer = LocalAPIServer(service: self)
+        apiServer?.start()
     }
 
     @MainActor
@@ -427,21 +485,36 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
         let change = changeDetector.difference(for: pixelBuffer)
         let force = now - lastForcedOCRWallTime >= options.forceOCRInterval
-        guard force || change >= options.changeThreshold else { return }
+
+        let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(pts, firstPTS)))
+        let ptsSeconds = CMTimeGetSeconds(pts)
+        let wallClock = dateFormatter.string(from: Date())
+
+        let candidate = FrameCandidate(pixelBuffer: pixelBuffer, pts: pts, elapsed: elapsed, ptsSeconds: ptsSeconds, wallClock: wallClock, visualChange: change, sharpnessScore: change)
+
+        // Trajectory Frame Selection: Trigger OCR when motion stabilizes
+        let selectedCandidate: FrameCandidate?
+        if options.enableTrajectorySelection && !force {
+            selectedCandidate = trajectoryTracker.processFrame(candidate: candidate, threshold: options.changeThreshold)
+        } else {
+            selectedCandidate = (force || change >= options.changeThreshold) ? candidate : nil
+        }
+
+        guard let targetFrame = selectedCandidate else { return }
 
         lastOCRWallTime = now
         if force { lastForcedOCRWallTime = now }
         ocrInFlight = true
 
-        let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(pts, firstPTS)))
-        let ptsSeconds = CMTimeGetSeconds(pts)
-        let wallClock = dateFormatter.string(from: Date())
-        let retainedPixelBuffer = pixelBuffer
-
+        let retainedPixelBuffer = targetFrame.pixelBuffer
         let accurateMode = options.accurateOCR
+        let frameElapsed = targetFrame.elapsed
+        let framePTS = targetFrame.ptsSeconds
+        let frameClock = targetFrame.wallClock
+        let frameChange = targetFrame.visualChange
 
         ocrQueue.async {
-            let event = self.recognize(pixelBuffer: retainedPixelBuffer, elapsed: elapsed, ptsSeconds: ptsSeconds, wallClock: wallClock, visualChange: change, accurate: accurateMode)
+            let event = self.recognize(pixelBuffer: retainedPixelBuffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, accurate: accurateMode)
 
             self.captureQueue.async {
                 defer { self.ocrInFlight = false }
@@ -526,6 +599,75 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
     }
 
     private func even(_ val: Int) -> Int { max(2, val - (val % 2)) }
+}
+
+// MARK: - Local HTTP API Server
+
+final class LocalAPIServer: @unchecked Sendable {
+    private var listener: NWListener?
+    private unowned let service: RecorderService
+
+    init(service: RecorderService) {
+        self.service = service
+    }
+
+    func start(port: UInt16 = 8080) {
+        do {
+            let params = NWParameters.tcp
+            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            listener?.newConnectionHandler = { [weak self] connection in
+                self?.handleConnection(connection)
+            }
+            listener?.start(queue: .global(qos: .userInitiated))
+        } catch {}
+    }
+
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: .global(qos: .userInitiated))
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
+            guard let self, let data, let request = String(data: data, encoding: .utf8) else { connection.cancel(); return }
+
+            let path = request.split(separator: " ").dropFirst().first ?? "/"
+            var bodyJSON = "{}"
+
+            if path.hasPrefix("/api/status") {
+                let status: [String: Any] = [
+                    "app": "SpeedOCR Studio",
+                    "status": self.service.statusMessage,
+                    "isRecording": self.service.isRecording,
+                    "fps": self.service.options.fps,
+                    "eventCount": self.service.liveEvents.count,
+                    "trajectorySelection": self.service.options.enableTrajectorySelection
+                ]
+                if let jsonData = try? JSONSerialization.data(withJSONObject: status), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/events") {
+                if let jsonData = try? JSONEncoder().encode(self.service.liveEvents), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/latest") {
+                if let last = self.service.liveEvents.last, let jsonData = try? JSONEncoder().encode(last), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            }
+
+            let response = """
+            HTTP/1.1 200 OK\r
+            Content-Type: application/json\r
+            Access-Control-Allow-Origin: *\r
+            Access-Control-Allow-Headers: *\r
+            Content-Length: \(bodyJSON.utf8.count)\r
+            Connection: close\r
+            \r
+            \(bodyJSON)
+            """
+
+            connection.send(content: Data(response.utf8), completion: .contentProcessed({ _ in
+                connection.cancel()
+            }))
+        }
+    }
 }
 
 // MARK: - Screen Lasso Window & Overlay
@@ -707,6 +849,13 @@ struct SpeedOCRDashboard: View {
 
                 Spacer()
 
+                Toggle(isOn: $recorder.options.enableTrajectorySelection) {
+                    Label("Trajectory Selection", systemImage: "chart.line.uptrend.xyaxis")
+                        .font(.system(size: 12))
+                }
+                .toggleStyle(.checkbox)
+                .disabled(recorder.isRecording)
+
                 Toggle(isOn: $recorder.options.captureAudio) {
                     Label("Audio", systemImage: recorder.options.captureAudio ? "mic.fill" : "mic.slash")
                         .font(.system(size: 12))
@@ -732,7 +881,12 @@ struct SpeedOCRDashboard: View {
                 Text(recorder.statusMessage)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.secondary)
+
                 Spacer()
+
+                Text("⚡ Local API: http://127.0.0.1:8080/api/events")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.7))
 
                 if copiedBanner {
                     Text("✓ Copied to clipboard!")
@@ -821,7 +975,7 @@ struct SpeedOCRDashboard: View {
                 }
             }
         }
-        .frame(minWidth: 780, minHeight: 520)
+        .frame(minWidth: 800, minHeight: 520)
     }
 
     private var allText: String {

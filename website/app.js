@@ -1,42 +1,90 @@
 document.addEventListener('DOMContentLoaded', () => {
   // --- 1. Canvas Background Particles ---
   const canvas = document.getElementById('particleCanvas');
-  const ctx = canvas.getContext('2d');
-  let width = canvas.width = window.innerWidth;
-  let height = canvas.height = window.innerHeight;
+  if (canvas) {
+    const ctx = canvas.getContext('2d');
+    let width = canvas.width = window.innerWidth;
+    let height = canvas.height = window.innerHeight;
 
-  window.addEventListener('resize', () => {
-    width = canvas.width = window.innerWidth;
-    height = canvas.height = window.innerHeight;
-  });
-
-  const particles = Array.from({ length: 45 }, () => ({
-    x: Math.random() * width,
-    y: Math.random() * height,
-    vx: (Math.random() - 0.5) * 0.4,
-    vy: (Math.random() - 0.5) * 0.4,
-    radius: Math.random() * 2 + 1,
-    alpha: Math.random() * 0.4 + 0.1
-  }));
-
-  function drawParticles() {
-    ctx.clearRect(0, 0, width, height);
-    particles.forEach(p => {
-      p.x += p.vx;
-      p.y += p.vy;
-      if (p.x < 0) p.x = width; if (p.x > width) p.x = 0;
-      if (p.y < 0) p.y = height; if (p.y > height) p.y = 0;
-
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(0, 102, 255, ${p.alpha})`;
-      ctx.fill();
+    window.addEventListener('resize', () => {
+      width = canvas.width = window.innerWidth;
+      height = canvas.height = window.innerHeight;
     });
-    requestAnimationFrame(drawParticles);
-  }
-  drawParticles();
 
-  // --- 2. 3D Window Tilt Effect ---
+    const particles = Array.from({ length: 45 }, () => ({
+      x: Math.random() * width,
+      y: Math.random() * height,
+      vx: (Math.random() - 0.5) * 0.4,
+      vy: (Math.random() - 0.5) * 0.4,
+      radius: Math.random() * 2 + 1,
+      alpha: Math.random() * 0.4 + 0.1
+    }));
+
+    function drawParticles() {
+      ctx.clearRect(0, 0, width, height);
+      particles.forEach(p => {
+        p.x += p.vx;
+        p.y += p.vy;
+        if (p.x < 0) p.x = width; if (p.x > width) p.x = 0;
+        if (p.y < 0) p.y = height; if (p.y > height) p.y = 0;
+
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0, 102, 255, ${p.alpha})`;
+        ctx.fill();
+      });
+      requestAnimationFrame(drawParticles);
+    }
+    drawParticles();
+  }
+
+  // --- 2. Live Mac App Local API Auto-Discovery ---
+  const windowBadge = document.querySelector('.window-badge');
+  const heroFeed = document.getElementById('heroFeed');
+
+  function checkLocalMacAppAPI() {
+    fetch('http://127.0.0.1:8080/api/status')
+      .then(res => res.json())
+      .then(data => {
+        if (windowBadge) {
+          windowBadge.innerHTML = `<span class="green-dot"></span> ⚡ CONNECTED TO MAC APP (${data.isRecording ? 'RECORDING' : 'READY'})`;
+        }
+        if (data.isRecording) {
+          fetch('http://127.0.0.1:8080/api/events')
+            .then(res => res.json())
+            .then(events => {
+              if (Array.isArray(events) && events.length > 0 && heroFeed) {
+                heroFeed.innerHTML = events.slice(-4).map(e => `
+                  <div class="transcript-card">
+                    <div class="card-meta">
+                      <span class="time-tag">${formatTime(e.elapsedSeconds)}</span>
+                      <span class="clock-tag">${e.wallClockISO8601}</span>
+                    </div>
+                    <div class="card-text">${escapeHTML(e.text)}</div>
+                  </div>
+                `).join('');
+              }
+            }).catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }
+
+  setInterval(checkLocalMacAppAPI, 2000);
+
+  function formatTime(sec) {
+    const s = Math.floor(sec);
+    const ms = Math.floor((sec - s) * 10);
+    return `00:${s < 10 ? '0' : ''}${s}.${ms}`;
+  }
+
+  function escapeHTML(str) {
+    return str.replace(/[&<>'"]/g, 
+      tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag)
+    );
+  }
+
+  // --- 3. 3D Window Tilt Effect ---
   const tiltContainer = document.getElementById('tiltContainer');
   const appWindow = document.getElementById('appWindow');
 
@@ -59,7 +107,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // --- 3. Animated Metric Counters ---
+  // --- 4. Animated Metric Counters ---
   const metricCards = document.querySelectorAll('.metric-number');
   let animated = false;
 
@@ -90,7 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('scroll', checkMetricsScroll);
   checkMetricsScroll();
 
-  // --- 4. Multi-Mode Sandbox Tabs ---
+  // --- 5. Multi-Mode Sandbox Tabs ---
   const tabBtns = document.querySelectorAll('.tab-btn');
   const tabContents = document.querySelectorAll('.tab-content');
 
@@ -105,7 +153,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // --- 5. Sandbox 1: Lasso Crop Logic ---
+  // --- 6. Sandbox 1: Lasso Crop Logic ---
   const screen = document.getElementById('simulatedScreen');
   const lasso = document.getElementById('lassoBox');
   const dimensions = document.getElementById('lassoDimensions');
@@ -161,7 +209,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => { btnCopyLasso.textContent = '📋 Copy Text'; }, 2000);
   });
 
-  // --- 6. Sandbox 2: Auto-Scroll Engine ---
+  // --- 7. Sandbox 2: Auto-Scroll Engine ---
   const viewport = document.getElementById('embeddedViewport');
   const btnAutoScroll = document.getElementById('btnAutoScroll');
   const autoScrollIcon = document.getElementById('autoScrollIcon');
@@ -217,7 +265,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => { btnCopyHarvest.textContent = '📋 Copy All'; }, 2000);
   });
 
-  // --- 7. Sandbox 3: Multi-Format Exporter ---
+  // --- 8. Sandbox 3: Multi-Format Exporter ---
   const formatBtns = document.querySelectorAll('.format-btn');
   const codeView = document.getElementById('exportCodeView');
   const btnCopyExport = document.getElementById('btnCopyExport');
