@@ -36,6 +36,16 @@ struct OCREvent: Codable, Identifiable {
     var scaleFactor: Double = 1.0
 }
 
+struct DiagnosticMetrics: Codable {
+    let totalEvents: Int
+    let totalCharacters: Int
+    let averageRegionsPerFrame: Double
+    let averageScaleFactor: Double
+    let isRecording: Bool
+    let statusMessage: String
+    let currentSessionPath: String
+}
+
 struct RecordingOptions {
     var fps: Int = 60
     var ocrFPS: Double = 6.0
@@ -46,6 +56,7 @@ struct RecordingOptions {
     var forceOCRInterval: Double = 1.25
     var region: CGRect? = nil
     var enableTrajectorySelection: Bool = true
+    var enablePostRecoveryPass: Bool = true
 }
 
 // MARK: - High-DPI Upscaling Engine
@@ -57,7 +68,6 @@ final class ImageScaler: @unchecked Sendable {
         let w = CVPixelBufferGetWidth(pixelBuffer)
         let h = CVPixelBufferGetHeight(pixelBuffer)
 
-        // If capture region is small (e.g. 525x178), upscale 2.5x to boost text height for Vision OCR
         let targetScale: Double
         if w < 600 || h < 400 {
             targetScale = 2.5
@@ -256,6 +266,31 @@ final class SidecarWriter: @unchecked Sendable {
     }
 }
 
+// MARK: - Post-Session Recovery & Consensus Processor
+
+final class PostSessionProcessor: @unchecked Sendable {
+    func processSession(directory: URL, events: [OCREvent]) {
+        let consensusURL = directory.appendingPathComponent("consensus.txt")
+        var lines: [String] = []
+        var seen = Set<String>()
+
+        for event in events {
+            let split = event.text.split(separator: "\n").map(String.init)
+            for line in split {
+                let clean = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                let norm = clean.lowercased()
+                if !clean.isEmpty && !seen.contains(norm) {
+                    seen.insert(norm)
+                    lines.append(clean)
+                }
+            }
+        }
+
+        let content = lines.joined(separator: "\n") + "\n"
+        try? content.write(to: consensusURL, atomically: true, encoding: .utf8)
+    }
+}
+
 // MARK: - Frame Change Detector
 
 final class FrameChangeDetector: @unchecked Sendable {
@@ -324,6 +359,7 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
     private var audioInput: AVAssetWriterInput?
     private var sidecar: SidecarWriter?
     private var apiServer: LocalAPIServer?
+    private let postProcessor = PostSessionProcessor()
 
     private var writerStarted = false
     private var firstPTS: CMTime?
@@ -480,6 +516,10 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
                 try? self.sidecar?.finish(finalElapsed: finalElapsed)
 
+                if let dir = self.currentSessionFolder {
+                    self.postProcessor.processSession(directory: dir, events: self.liveEvents)
+                }
+
                 guard let writer = self.assetWriter, self.writerStarted else {
                     continuation.resume()
                     return
@@ -589,13 +629,12 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
         audioInput?.append(sampleBuffer)
     }
 
-    // High-Recall Vision Recognition with Micro-Font Detection & Adaptive Line Grouping
     nonisolated private func recognizeHighRecall(pixelBuffer: CVPixelBuffer, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, scaleFactor: Double) -> OCREvent? {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         request.automaticallyDetectsLanguage = true
-        request.minimumTextHeight = 0.001 // Ultra-low height to capture micro UI fonts & headers
+        request.minimumTextHeight = 0.001
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
@@ -606,7 +645,6 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
         guard let results = request.results, !results.isEmpty else { return nil }
 
-        // Adaptive Line Grouping: Group bounding boxes into visual lines top-to-bottom, left-to-right
         var rawBoxes: [(obs: VNRecognizedTextObservation, text: String, conf: Float)] = []
         for observation in results {
             guard let candidate = observation.topCandidates(1).first else { continue }
@@ -617,7 +655,6 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
         guard !rawBoxes.isEmpty else { return nil }
 
-        // Sort top-to-bottom
         let sortedObs = rawBoxes.sorted { lhs, rhs in
             let yDelta = lhs.obs.boundingBox.midY - rhs.obs.boundingBox.midY
             if abs(yDelta) > 0.02 { return lhs.obs.boundingBox.midY > rhs.obs.boundingBox.midY }
@@ -704,10 +741,60 @@ final class LocalAPIServer: @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
             guard let self, let data, let request = String(data: data, encoding: .utf8) else { connection.cancel(); return }
 
-            let path = request.split(separator: " ").dropFirst().first ?? "/"
-            var bodyJSON = "{}"
+            let lines = request.split(separator: "\r\n")
+            let firstLine = lines.first ?? ""
+            let parts = firstLine.split(separator: " ")
+            let method = parts.first ?? "GET"
+            let path = parts.dropFirst().first ?? "/"
 
-            if path.hasPrefix("/api/status") {
+            var bodyJSON = "{}"
+            var contentType = "application/json"
+
+            if method == "POST" && path == "/api/control/start" {
+                Task { @MainActor in
+                    await self.service.startRecording()
+                }
+                bodyJSON = "{\"status\":\"starting\",\"isRecording\":true}"
+            } else if method == "POST" && path == "/api/control/stop" {
+                Task { @MainActor in
+                    await self.service.stopRecording()
+                }
+                bodyJSON = "{\"status\":\"stopping\",\"isRecording\":false}"
+            } else if path.hasPrefix("/api/transcript") {
+                contentType = "text/plain; charset=utf-8"
+                let allText = self.service.liveEvents.map { $0.text }.joined(separator: "\n\n")
+                bodyJSON = allText
+            } else if path.hasPrefix("/api/srt") {
+                contentType = "text/plain; charset=utf-8"
+                var srtLines: [String] = []
+                for (idx, e) in self.service.liveEvents.enumerated() {
+                    srtLines.append("\(idx + 1)\n00:00:\(Int(e.elapsedSeconds)),000 --> 00:00:\(Int(e.elapsedSeconds) + 2),000\n\(e.text)\n")
+                }
+                bodyJSON = srtLines.joined(separator: "\n")
+            } else if path.hasPrefix("/api/search") {
+                let query = path.split(separator: "?").dropFirst().first?.replacingOccurrences(of: "q=", with: "").lowercased() ?? ""
+                let matches = self.service.liveEvents.filter { $0.text.lowercased().contains(query) }
+                if let jsonData = try? JSONEncoder().encode(matches), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/diagnostics") {
+                let totalChars = self.service.liveEvents.reduce(0) { $0 + $1.text.count }
+                let avgRegions = self.service.liveEvents.isEmpty ? 0 : Double(self.service.liveEvents.reduce(0) { $0 + $1.detectedRegionsCount }) / Double(self.service.liveEvents.count)
+                let avgScale = self.service.liveEvents.isEmpty ? 1.0 : Double(self.service.liveEvents.reduce(0.0) { $0 + $1.scaleFactor }) / Double(self.service.liveEvents.count)
+
+                let diag = DiagnosticMetrics(
+                    totalEvents: self.service.liveEvents.count,
+                    totalCharacters: totalChars,
+                    averageRegionsPerFrame: avgRegions,
+                    averageScaleFactor: avgScale,
+                    isRecording: self.service.isRecording,
+                    statusMessage: self.service.statusMessage,
+                    currentSessionPath: self.service.currentSessionFolder?.path ?? ""
+                )
+                if let jsonData = try? JSONEncoder().encode(diag), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/status") {
                 let status: [String: Any] = [
                     "app": "SpeedOCR Studio",
                     "status": self.service.statusMessage,
@@ -731,7 +818,7 @@ final class LocalAPIServer: @unchecked Sendable {
 
             let response = """
             HTTP/1.1 200 OK\r
-            Content-Type: application/json\r
+            Content-Type: \(contentType)\r
             Access-Control-Allow-Origin: *\r
             Access-Control-Allow-Headers: *\r
             Content-Length: \(bodyJSON.utf8.count)\r
