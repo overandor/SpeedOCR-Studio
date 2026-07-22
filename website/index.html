@@ -20,8 +20,8 @@
       </div>
       <nav class="nav-links">
         <a href="#features">Features</a>
+        <a href="#browser-sandbox">Web Auto-Scroll & OCR</a>
         <a href="#demo">Live Sandbox</a>
-        <a href="#how-it-works">How it Works</a>
         <a href="#faq">FAQ</a>
       </nav>
       <div class="nav-actions">
@@ -50,8 +50,8 @@
         <a href="#download" class="btn btn-hero-primary">
           <span class="apple-icon"></span> Download for macOS (Universal)
         </a>
-        <a href="#demo" class="btn btn-hero-secondary">
-          <span class="play-icon">▶</span> Try Interactive Sandbox
+        <a href="#browser-sandbox" class="btn btn-hero-secondary">
+          <span class="play-icon">🌐</span> Try Embedded Web Auto-Scroll
         </a>
       </div>
 
@@ -63,7 +63,7 @@
         <span>✓ 100% Private On-Device</span>
       </div>
 
-      <!-- App Interface Interactive Window Preview -->
+      <!-- App Interface Window Preview -->
       <div class="app-window-frame shadow-glow">
         <div class="window-header">
           <div class="window-controls">
@@ -118,6 +118,96 @@
     </div>
   </section>
 
+  <!-- Embedded Web Browser & Auto-Scroll Harvester Section -->
+  <section class="section browser-sandbox-section" id="browser-sandbox">
+    <div class="container">
+      <div class="section-header">
+        <h2 class="section-title">Embedded Web View & <span class="gradient-text">Auto-Scroll Text Harvester</span></h2>
+        <p class="section-subtitle">Browse web pages directly inside the embedded container. Enable Auto-Scroll to automatically scroll down long documents/feeds, auto-trigger "Load More", and capture all OCR text automatically!</p>
+      </div>
+
+      <div class="browser-app-container shadow-glow">
+        <!-- Address & Toolbar Header -->
+        <div class="browser-address-bar">
+          <div class="nav-buttons">
+            <button class="nav-btn" id="btnBack">‹</button>
+            <button class="nav-btn" id="btnForward">›</button>
+            <button class="nav-btn" id="btnRefresh">↻</button>
+          </div>
+          <div class="address-input-wrapper">
+            <span class="lock-icon">🔒</span>
+            <input type="text" id="browserUrlInput" value="https://example-feed.org/articles/south-africa-data-report" />
+          </div>
+          <button class="btn btn-sm btn-primary" id="btnAutoScroll">
+            <span id="autoScrollIcon">▶</span> <span id="autoScrollText">Auto-Scroll & Capture</span>
+          </button>
+        </div>
+
+        <div class="browser-workspace">
+          <!-- Embedded Browser Content Canvas -->
+          <div class="embedded-viewport" id="embeddedViewport">
+            <div class="web-page-content" id="webPageContent">
+              <div class="article-header">
+                <span class="article-category">ECONOMIC INSIGHTS</span>
+                <h1>Regional Data Trends & Economic Indicator Report</h1>
+                <div class="article-byline">Published: July 2026 • 8 min read</div>
+              </div>
+
+              <div class="article-body">
+                <p><strong>Overview:</strong> Comprehensive statistical report analyzing trade, digital transformation, and market trends across South African economic sectors.</p>
+
+                <div class="data-table-preview">
+                  <div class="table-row header">
+                    <span>SECTOR</span><span>GROWTH</span><span>EXPORT VALUE</span>
+                  </div>
+                  <div class="table-row"><span>Agriculture</span><span>+4.2%</span><span>R 18.5 Billion</span></div>
+                  <div class="table-row"><span>Mining & Minerals</span><span>+2.8%</span><span>R 42.1 Billion</span></div>
+                  <div class="table-row"><span>Renewable Energy</span><span>+14.6%</span><span>R 9.3 Billion</span></div>
+                  <div class="table-row"><span>Financial Technology</span><span>+18.9%</span><span>R 12.7 Billion</span></div>
+                </div>
+
+                <p>Key digital indicators show accelerated adoption of cloud infrastructure and local processing pipelines, improving operational efficiency by over 30% across major commercial hubs.</p>
+
+                <div class="article-section">
+                  <h3>Logistics & Supply Chain Dynamics</h3>
+                  <p>Port throughput metrics recorded steady quarter-over-quarter expansion. Logistics automation platforms enabled real-time tracking of bulk commodity shipments from inland hubs to coastal terminals.</p>
+                </div>
+
+                <!-- Load More Button -->
+                <div class="load-more-container">
+                  <button class="btn-load-more" id="btnLoadMore">⚡ Load More Economic Records...</button>
+                </div>
+
+                <div class="article-section hidden-content" id="hiddenContent">
+                  <h3>Expanded Data Records</h3>
+                  <p>Record #1049: Regional infrastructure investments totaled R 15.2B in Q2 2026.</p>
+                  <p>Record #1050: Digital payment volume grew 24% year-over-year, driven by mobile web applications.</p>
+                  <p>Record #1051: Telecommunications coverage expanded to 98% 5G density in major metropolitan corridors.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Harvested OCR Output Panel -->
+          <div class="harvested-panel">
+            <div class="panel-header">
+              <h3>Captured OCR Output</h3>
+              <button class="btn btn-sm btn-secondary" id="btnCopyHarvest">📋 Copy All</button>
+            </div>
+            <div class="harvested-feed" id="harvestedFeed">
+              <div class="harvest-item">
+                <span class="timestamp">[00:00.0]</span> Regional Data Trends & Economic Indicator Report
+              </div>
+              <div class="harvest-item">
+                <span class="timestamp">[00:01.2]</span> SECTOR: Agriculture +4.2% Export Value: R 18.5 Billion
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Interactive Sandbox Section -->
   <section class="section sandbox-section" id="demo">
     <div class="container">
@@ -138,7 +228,6 @@
                 <p>SpeedOCR Studio runs Vision OCR asynchronously on video frames, detecting optical character changes without interrupting 60 FPS recording.</p>
               </div>
             </div>
-            <!-- Selection Overlay -->
             <div class="lasso-box" id="lassoBox">
               <span class="lasso-dimensions" id="lassoDimensions">320 × 180</span>
             </div>
@@ -187,38 +276,9 @@
         </div>
 
         <div class="feature-card">
-          <div class="feature-icon">🔒</div>
-          <h3>100% Local & Private</h3>
-          <p>Every line of OCR is recognized locally on your Mac using Apple's Neural Engine. Zero internet connection required, zero cloud data sent.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- How It Works Section -->
-  <section class="section how-section" id="how-it-works">
-    <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">How It Works in <span class="gradient-text">3 Simple Steps</span></h2>
-      </div>
-
-      <div class="steps-grid">
-        <div class="step-card">
-          <div class="step-number">01</div>
-          <h3>Select Your Screen Region</h3>
-          <p>Click "Select Region (Lasso)" and drag a rectangle over the app, video, or document panel you want to record.</p>
-        </div>
-
-        <div class="step-card">
-          <div class="step-number">02</div>
-          <h3>Click Start Recording</h3>
-          <p>SpeedOCR Studio records full video while recognizing text in real time as you scroll or present.</p>
-        </div>
-
-        <div class="step-card">
-          <div class="step-number">03</div>
-          <h3>Copy & Export</h3>
-          <p>Click "Copy Clean List" or "Copy All Text" to grab recognized text instantly for notes, code, or documentation.</p>
+          <div class="feature-icon">🌐</div>
+          <h3>Auto-Scrolling Reader</h3>
+          <p>Automates smooth page scrolling and button triggers for capturing long documents, articles, and feeds effortlessly.</p>
         </div>
       </div>
     </div>
