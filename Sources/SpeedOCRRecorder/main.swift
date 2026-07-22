@@ -32,18 +32,67 @@ struct OCREvent: Codable, Identifiable {
     let text: String
     let boxes: [OCRBox]
     var passType: String = "live"
+    var detectedRegionsCount: Int = 0
+    var scaleFactor: Double = 1.0
 }
 
 struct RecordingOptions {
     var fps: Int = 60
     var ocrFPS: Double = 6.0
     var displayIndex: Int = 0
-    var accurateOCR: Bool = false
+    var accurateOCR: Bool = true
     var captureAudio: Bool = true
-    var changeThreshold: Double = 0.018
+    var changeThreshold: Double = 0.012
     var forceOCRInterval: Double = 1.25
     var region: CGRect? = nil
     var enableTrajectorySelection: Bool = true
+}
+
+// MARK: - High-DPI Upscaling Engine
+
+final class ImageScaler: @unchecked Sendable {
+    private let context = CIContext(options: [.cacheIntermediates: false])
+
+    func upscaleIfNeeded(_ pixelBuffer: CVPixelBuffer) -> (CVPixelBuffer, Double) {
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+
+        // If capture region is small (e.g. 525x178), upscale 2.5x to boost text height for Vision OCR
+        let targetScale: Double
+        if w < 600 || h < 400 {
+            targetScale = 2.5
+        } else if w < 1000 || h < 700 {
+            targetScale = 1.8
+        } else {
+            return (pixelBuffer, 1.0)
+        }
+
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: CGFloat(targetScale), y: CGFloat(targetScale)))
+
+        let newWidth = Int(Double(w) * targetScale)
+        let newHeight = Int(Double(h) * targetScale)
+
+        var newBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            newWidth,
+            newHeight,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true
+            ] as CFDictionary,
+            &newBuffer
+        )
+
+        guard status == kCVReturnSuccess, let outputBuffer = newBuffer else {
+            return (pixelBuffer, 1.0)
+        }
+
+        context.render(scaledImage, to: outputBuffer)
+        return (outputBuffer, targetScale)
+    }
 }
 
 // MARK: - Trajectory Frame Candidate Buffer
@@ -85,7 +134,6 @@ final class TrajectoryTracker: @unchecked Sendable {
             }
             return nil
         } else if isTrackingMotion {
-            // Motion just stabilized! Pick the candidate with highest visual change & stability
             isTrackingMotion = false
             let bestCandidate = candidateBuffer.max(by: { $0.sharpnessScore < $1.sharpnessScore }) ?? candidate
             candidateBuffer.removeAll()
@@ -287,6 +335,7 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
     private let changeDetector = FrameChangeDetector()
     private let trajectoryTracker = TrajectoryTracker()
+    private let scaler = ImageScaler()
     private let dateFormatter = ISO8601DateFormatter()
 
     override init() {
@@ -492,7 +541,6 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
 
         let candidate = FrameCandidate(pixelBuffer: pixelBuffer, pts: pts, elapsed: elapsed, ptsSeconds: ptsSeconds, wallClock: wallClock, visualChange: change, sharpnessScore: change)
 
-        // Trajectory Frame Selection: Trigger OCR when motion stabilizes
         let selectedCandidate: FrameCandidate?
         if options.enableTrajectorySelection && !force {
             selectedCandidate = trajectoryTracker.processFrame(candidate: candidate, threshold: options.changeThreshold)
@@ -506,15 +554,15 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
         if force { lastForcedOCRWallTime = now }
         ocrInFlight = true
 
-        let retainedPixelBuffer = targetFrame.pixelBuffer
-        let accurateMode = options.accurateOCR
+        let (scaledBuffer, scaleFactor) = scaler.upscaleIfNeeded(targetFrame.pixelBuffer)
+
         let frameElapsed = targetFrame.elapsed
         let framePTS = targetFrame.ptsSeconds
         let frameClock = targetFrame.wallClock
         let frameChange = targetFrame.visualChange
 
         ocrQueue.async {
-            let event = self.recognize(pixelBuffer: retainedPixelBuffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, accurate: accurateMode)
+            let event = self.recognizeHighRecall(pixelBuffer: scaledBuffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, scaleFactor: scaleFactor)
 
             self.captureQueue.async {
                 defer { self.ocrInFlight = false }
@@ -541,12 +589,13 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
         audioInput?.append(sampleBuffer)
     }
 
-    nonisolated private func recognize(pixelBuffer: CVPixelBuffer, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, accurate: Bool) -> OCREvent? {
+    // High-Recall Vision Recognition with Micro-Font Detection & Adaptive Line Grouping
+    nonisolated private func recognizeHighRecall(pixelBuffer: CVPixelBuffer, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, scaleFactor: Double) -> OCREvent? {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = accurate ? .accurate : .fast
-        request.usesLanguageCorrection = accurate
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
         request.automaticallyDetectsLanguage = true
-        request.minimumTextHeight = 0.006
+        request.minimumTextHeight = 0.001 // Ultra-low height to capture micro UI fonts & headers
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
@@ -555,23 +604,51 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
             return nil
         }
 
-        let observations = (request.results ?? []).sorted { lhs, rhs in
-            let yDelta = lhs.boundingBox.midY - rhs.boundingBox.midY
-            if abs(yDelta) > 0.015 { return lhs.boundingBox.midY > rhs.boundingBox.midY }
-            return lhs.boundingBox.minX < rhs.boundingBox.minX
-        }
+        guard let results = request.results, !results.isEmpty else { return nil }
 
-        var boxes: [OCRBox] = []
-        for observation in observations {
+        // Adaptive Line Grouping: Group bounding boxes into visual lines top-to-bottom, left-to-right
+        var rawBoxes: [(obs: VNRecognizedTextObservation, text: String, conf: Float)] = []
+        for observation in results {
             guard let candidate = observation.topCandidates(1).first else { continue }
             let clean = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { continue }
-            boxes.append(OCRBox(text: clean, confidence: candidate.confidence, x: observation.boundingBox.origin.x, y: observation.boundingBox.origin.y, width: observation.boundingBox.size.width, height: observation.boundingBox.size.height))
+            rawBoxes.append((observation, clean, candidate.confidence))
         }
 
-        guard !boxes.isEmpty else { return nil }
-        let text = boxes.map { $0.text }.joined(separator: "\n")
-        return OCREvent(elapsedSeconds: elapsed, wallClockISO8601: wallClock, framePTSSeconds: ptsSeconds, visualChange: visualChange, text: text, boxes: boxes)
+        guard !rawBoxes.isEmpty else { return nil }
+
+        // Sort top-to-bottom
+        let sortedObs = rawBoxes.sorted { lhs, rhs in
+            let yDelta = lhs.obs.boundingBox.midY - rhs.obs.boundingBox.midY
+            if abs(yDelta) > 0.02 { return lhs.obs.boundingBox.midY > rhs.obs.boundingBox.midY }
+            return lhs.obs.boundingBox.minX < rhs.obs.boundingBox.minX
+        }
+
+        var boxes: [OCRBox] = []
+        for item in sortedObs {
+            let obs = item.obs
+            boxes.append(OCRBox(
+                text: item.text,
+                confidence: item.conf,
+                x: Double(obs.boundingBox.origin.x),
+                y: Double(obs.boundingBox.origin.y),
+                width: Double(obs.boundingBox.size.width),
+                height: Double(obs.boundingBox.size.height)
+            ))
+        }
+
+        let fullText = boxes.map { $0.text }.joined(separator: "\n")
+        return OCREvent(
+            elapsedSeconds: elapsed,
+            wallClockISO8601: wallClock,
+            framePTSSeconds: ptsSeconds,
+            visualChange: visualChange,
+            text: fullText,
+            boxes: boxes,
+            passType: "accurate-high-recall",
+            detectedRegionsCount: boxes.count,
+            scaleFactor: scaleFactor
+        )
     }
 
     nonisolated private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
@@ -850,7 +927,7 @@ struct SpeedOCRDashboard: View {
                 Spacer()
 
                 Toggle(isOn: $recorder.options.enableTrajectorySelection) {
-                    Label("Trajectory Selection", systemImage: "chart.line.uptrend.xyaxis")
+                    Label("High-Recall Mode", systemImage: "text.viewfinder")
                         .font(.system(size: 12))
                 }
                 .toggleStyle(.checkbox)
@@ -1044,6 +1121,16 @@ struct OCREventRow: View {
                 Text(event.wallClockISO8601)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+
+                if event.scaleFactor > 1.0 {
+                    Text("\(String(format: "%.1fx", event.scaleFactor)) Upscaled")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.2))
+                        .foregroundColor(.purple)
+                        .cornerRadius(3)
+                }
 
                 Spacer()
 
