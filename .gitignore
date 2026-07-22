@@ -1,0 +1,23 @@
+# Swift PM
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj
+*.xcworkspace
+
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Built Apps & Distributions
+*.app/
+*.zip
+
+# Session Outputs
+~/Movies/SpeedOCR-*
+ocr.jsonl
+ocr.srt
+transcript.txt
+capture.mp4

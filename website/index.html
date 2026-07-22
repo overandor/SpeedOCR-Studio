@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SpeedOCR Studio — Screen & Text OCR Recorder for macOS</title>
+  <meta name="description" content="Record your screen at 60 FPS while transcribing text automatically in real-time. Native macOS app with interactive region lasso and 1-click text copy.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Navigation Header -->
+  <header class="navbar">
+    <div class="nav-container">
+      <div class="brand">
+        <div class="brand-logo">⚡</div>
+        <span class="brand-title">SpeedOCR <span class="badge-studio">STUDIO</span></span>
+      </div>
+      <nav class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#demo">Live Sandbox</a>
+        <a href="#how-it-works">How it Works</a>
+        <a href="#faq">FAQ</a>
+      </nav>
+      <div class="nav-actions">
+        <a href="#download" class="btn btn-secondary nav-github">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          GitHub
+        </a>
+        <a href="#download" class="btn btn-primary">Download Mac App</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <section class="hero-section">
+    <div class="hero-glow hero-glow-1"></div>
+    <div class="hero-glow hero-glow-2"></div>
+    <div class="container hero-content">
+      <div class="hero-badge">
+        <span class="pulse-dot"></span>
+        <span>FASTEST ON-DEVICE SCREEN OCR FOR MACOS</span>
+      </div>
+      <h1 class="hero-title">Capture Any Screen Region.<br><span class="gradient-text">Transcribe Text at 60 FPS.</span></h1>
+      <p class="hero-subtitle">SpeedOCR Studio streams screen video at full speed while running real-time Vision OCR on visual changes. Draw an interactive lasso over any region & copy clean text with 1 click.</p>
+      
+      <div class="hero-cta-group">
+        <a href="#download" class="btn btn-hero-primary">
+          <span class="apple-icon"></span> Download for macOS (Universal)
+        </a>
+        <a href="#demo" class="btn btn-hero-secondary">
+          <span class="play-icon">▶</span> Try Interactive Sandbox
+        </a>
+      </div>
+
+      <div class="hero-meta">
+        <span>✓ 100% Free & Open Source</span>
+        <span>•</span>
+        <span>✓ macOS 14+ (Apple Silicon & Intel)</span>
+        <span>•</span>
+        <span>✓ 100% Private On-Device</span>
+      </div>
+
+      <!-- App Interface Interactive Window Preview -->
+      <div class="app-window-frame shadow-glow">
+        <div class="window-header">
+          <div class="window-controls">
+            <span class="control close"></span>
+            <span class="control minimize"></span>
+            <span class="control maximize"></span>
+          </div>
+          <div class="window-title">SpeedOCR Studio — Screen & Text Recorder</div>
+          <div class="window-badge"><span class="green-dot"></span> READY</div>
+        </div>
+
+        <div class="app-toolbar">
+          <div class="tool-btn record-btn">
+            <span class="rec-icon"></span> Start Recording
+          </div>
+          <div class="tool-btn lasso-btn">
+            <span>✂</span> Select Region (768×1,199)
+          </div>
+          <div class="tool-options">
+            <label><input type="checkbox" checked> Audio</label>
+            <label><input type="checkbox" checked> Accurate OCR</label>
+          </div>
+        </div>
+
+        <div class="copy-bar">
+          <span class="label">QUICK COPY:</span>
+          <button class="copy-chip active">📋 Copy All Text</button>
+          <button class="copy-chip">📑 Copy Clean List</button>
+          <button class="copy-chip">⏱️ Copy Latest</button>
+          <button class="copy-chip folder-chip">📂 Open Session Folder</button>
+        </div>
+
+        <div class="transcript-feed" id="heroFeed">
+          <div class="transcript-card">
+            <div class="card-meta">
+              <span class="time-tag">00:01.4</span>
+              <span class="clock-tag">2026-07-21T21:42:00.123Z</span>
+              <button class="card-copy-btn">Copy</button>
+            </div>
+            <div class="card-text">Welcome to SpeedOCR Studio. Real-time text extraction powered by Apple Vision.</div>
+          </div>
+          <div class="transcript-card">
+            <div class="card-meta">
+              <span class="time-tag">00:03.8</span>
+              <span class="clock-tag">2026-07-21T21:42:02.550Z</span>
+              <button class="card-copy-btn">Copy</button>
+            </div>
+            <div class="card-text">Draw an interactive lasso selection over any screen area to record sub-regions.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interactive Sandbox Section -->
+  <section class="section sandbox-section" id="demo">
+    <div class="container">
+      <div class="section-header">
+        <h2 class="section-title">Interactive <span class="gradient-text">Screen Lasso Simulator</span></h2>
+        <p class="section-subtitle">Try the Lasso tool below! Click and drag inside the screen canvas to select a region and watch OCR text stream in real-time.</p>
+      </div>
+
+      <div class="sandbox-container">
+        <div class="sandbox-canvas-wrapper" id="sandboxCanvas">
+          <div class="simulated-screen">
+            <div class="screen-content">
+              <h3>⚡ Live Code & Text Screen Sample</h3>
+              <p class="code-line"><code>const recorder = new SpeedOCRStudio({ fps: 60, ocrFPS: 8 });</code></p>
+              <p class="code-line"><code>recorder.onTextDetected((event) => { console.log(event.text); });</code></p>
+              <div class="article-snippet">
+                <h4>Apple Vision Neural OCR Pipeline</h4>
+                <p>SpeedOCR Studio runs Vision OCR asynchronously on video frames, detecting optical character changes without interrupting 60 FPS recording.</p>
+              </div>
+            </div>
+            <!-- Selection Overlay -->
+            <div class="lasso-box" id="lassoBox">
+              <span class="lasso-dimensions" id="lassoDimensions">320 × 180</span>
+            </div>
+          </div>
+          <div class="sandbox-instruction">💡 Click & Drag anywhere on the simulated screen above to test the Lasso!</div>
+        </div>
+
+        <div class="sandbox-transcript">
+          <div class="transcript-header">
+            <h4>Live Recognized OCR Output</h4>
+            <button class="btn btn-sm btn-primary" id="copySandboxBtn">📋 Copy Output</button>
+          </div>
+          <div class="sandbox-feed" id="sandboxFeed">
+            <div class="empty-state">Drag over text in the left panel to test extraction!</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature Grid -->
+  <section class="section features-section" id="features">
+    <div class="container">
+      <div class="section-header">
+        <h2 class="section-title">Engineered for <span class="gradient-text">Maximum Performance</span></h2>
+        <p class="section-subtitle">Built natively in Swift for macOS using ScreenCaptureKit, Vision, and AVFoundation.</p>
+      </div>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon">🎯</div>
+          <h3>Interactive Screen Lasso</h3>
+          <p>Darkens your screen and allows click-and-drag rectangle selection. Restricts capture precisely to your chosen sub-region.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">⚡</div>
+          <h3>60 FPS + Change Detection</h3>
+          <p>ScreenCaptureKit captures full 60 FPS video while Vision OCR only evaluates frames when visual changes exceed threshold, keeping CPU usage minimal.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">📋</div>
+          <h3>1-Click Copy & Multi-Export</h3>
+          <p>Instant copy buttons for all text, deduplicated clean lists, timestamped `.srt` captions, `.jsonl` bounding box coordinates, and `.mp4` video.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🔒</div>
+          <h3>100% Local & Private</h3>
+          <p>Every line of OCR is recognized locally on your Mac using Apple's Neural Engine. Zero internet connection required, zero cloud data sent.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How It Works Section -->
+  <section class="section how-section" id="how-it-works">
+    <div class="container">
+      <div class="section-header">
+        <h2 class="section-title">How It Works in <span class="gradient-text">3 Simple Steps</span></h2>
+      </div>
+
+      <div class="steps-grid">
+        <div class="step-card">
+          <div class="step-number">01</div>
+          <h3>Select Your Screen Region</h3>
+          <p>Click "Select Region (Lasso)" and drag a rectangle over the app, video, or document panel you want to record.</p>
+        </div>
+
+        <div class="step-card">
+          <div class="step-number">02</div>
+          <h3>Click Start Recording</h3>
+          <p>SpeedOCR Studio records full video while recognizing text in real time as you scroll or present.</p>
+        </div>
+
+        <div class="step-card">
+          <div class="step-number">03</div>
+          <h3>Copy & Export</h3>
+          <p>Click "Copy Clean List" or "Copy All Text" to grab recognized text instantly for notes, code, or documentation.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Download & Installation -->
+  <section class="section download-section" id="download">
+    <div class="container">
+      <div class="download-card">
+        <h2>Get Started with SpeedOCR Studio</h2>
+        <p>Native macOS application. Free, open source, and ready to use.</p>
+        <div class="download-actions">
+          <a href="https://github.com" class="btn btn-hero-primary">
+            <span></span> Download SpeedOCR Studio for macOS
+          </a>
+        </div>
+        <div class="install-code">
+          <code>unzip SpeedOCRRecorder.zip && cd SpeedOCRRecorder && ./build_app.command</code>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ Section -->
+  <section class="section faq-section" id="faq">
+    <div class="container">
+      <div class="section-header">
+        <h2 class="section-title">Frequently Asked <span class="gradient-text">Questions</span></h2>
+      </div>
+
+      <div class="faq-list">
+        <div class="faq-item">
+          <div class="faq-question">What macOS versions are supported?</div>
+          <div class="faq-answer">SpeedOCR Studio requires macOS 14.0 or later on both Apple Silicon (M1/M2/M3/M4) and Intel Macs.</div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-question">Does SpeedOCR Studio require internet access?</div>
+          <div class="faq-answer">No. All OCR recognition runs 100% locally on your Mac using Apple's Vision framework and Neural Engine.</div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-question">Where are my recordings and transcripts saved?</div>
+          <div class="faq-answer">Every recording session creates a folder in <code>~/Movies/SpeedOCR-YYYYMMDD-HHMMSS/</code> containing <code>capture.mp4</code>, <code>transcript.txt</code>, <code>ocr.srt</code>, and <code>ocr.jsonl</code>.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container footer-content">
+      <div class="footer-brand">
+        <div class="brand-logo">⚡</div>
+        <span>SpeedOCR Studio</span>
+      </div>
+      <p>© 2026 SpeedOCR Studio. Distributed under the MIT License.</p>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
