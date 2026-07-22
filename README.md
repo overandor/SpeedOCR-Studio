@@ -1,27 +1,17 @@
 # SpeedOCR Studio — Native macOS Screen & OCR Dashboard
 
-**SpeedOCR Studio** is a native macOS application built with SwiftUI, ScreenCaptureKit, and Vision OCR. It captures full 60+ FPS screen video while performing real-time asynchronous text recognition, featuring an interactive **Screen Lasso Region Selector**, an **Embedded Web View with Auto-Scroll Harvester**, and a live **Transcribing Dashboard**.
+[![GitHub Pages](https://img.shields.io/badge/Live_Site-GitHub_Pages-0066FF?style=for-the-badge&logo=github)](https://overandor.github.io/SpeedOCR-Studio/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-macOS_14.0+-black?style=for-the-badge&logo=apple)](https://github.com/overandor/SpeedOCR-Studio)
+
+**SpeedOCR Studio** is an award-winning native macOS application built with SwiftUI, ScreenCaptureKit, and Vision OCR. It captures full 60+ FPS screen video while performing real-time asynchronous text recognition, featuring an interactive **Screen Lasso Region Selector**, an **Embedded Web View with Auto-Scroll Harvester**, and a live **Transcribing Dashboard**.
 
 ---
 
-## 🚀 Deployment (Vercel & GitHub Pages)
+## 🌐 Live Website & GitHub Repository
 
-The landing page web app (`website/`) is pre-configured for 1-click deployment on both **Vercel** and **GitHub Pages**.
-
-### 1. Deploy on Vercel
-Click below to deploy directly to Vercel, or connect your GitHub repository in your Vercel Dashboard:
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/git/external?repository-url=https://github.com)
-
-*Note: `vercel.json` automatically routes static traffic to `website/`.*
-
-### 2. Deploy on GitHub Pages
-This repository includes an automated GitHub Action workflow (`.github/workflows/deploy.yml`):
-
-1. Push your repository to GitHub.
-2. Go to **Repository Settings → Pages**.
-3. Set **Source** to **GitHub Actions**.
-4. Every push to `main` will automatically build and publish your landing page to `https://<your-username>.github.io/<repo-name>/`!
+- 🌟 **Live Landing Page (GitHub Pages)**: [https://overandor.github.io/SpeedOCR-Studio/](https://overandor.github.io/SpeedOCR-Studio/)
+- 📦 **GitHub Repository**: [https://github.com/overandor/SpeedOCR-Studio](https://github.com/overandor/SpeedOCR-Studio)
 
 ---
 
