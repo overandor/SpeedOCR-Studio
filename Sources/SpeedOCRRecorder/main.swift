@@ -105,6 +105,11 @@ final class ImageScaler: @unchecked Sendable {
     }
 }
 
+struct UncheckedPixelBuffer: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+}
+
+
 // MARK: - Trajectory Frame Candidate Buffer
 
 final class FrameCandidate: @unchecked Sendable {
@@ -601,8 +606,10 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
         let frameClock = targetFrame.wallClock
         let frameChange = targetFrame.visualChange
 
+        let sendableBuffer = UncheckedPixelBuffer(buffer: scaledBuffer)
         ocrQueue.async {
-            let event = self.recognizeHighRecall(pixelBuffer: scaledBuffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, scaleFactor: scaleFactor)
+            let event = self.recognizeHighRecall(pixelBuffer: sendableBuffer.buffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, scaleFactor: scaleFactor)
+
 
             self.captureQueue.async {
                 defer { self.ocrInFlight = false }

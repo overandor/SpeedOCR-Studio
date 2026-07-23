@@ -1,4 +1,5 @@
-import Foundation
+import SwiftUI
+import AppKit
 import ScreenCaptureKit
 import AVFoundation
 import Vision
@@ -7,133 +8,13 @@ import CoreMedia
 import CoreVideo
 import CoreGraphics
 import ImageIO
+import Combine
+import Network
 
-// MARK: - CLI
+// MARK: - Data Models
 
-struct Options {
-    var fps: Int = 60
-    var ocrFPS: Double = 6.0
-    var displayIndex: Int = 0
-    var accurateOCR: Bool = false
-    var captureAudio: Bool = true
-    var changeThreshold: Double = 0.018
-    var forceOCRInterval: Double = 1.25
-    var outputDirectory: URL?
-
-    static func parse(_ args: [String]) throws -> Options {
-        var result = Options()
-        var i = 0
-
-        func requireValue(_ flag: String) throws -> String {
-            guard i + 1 < args.count else {
-                throw CLIError.missingValue(flag)
-            }
-            i += 1
-            return args[i]
-        }
-
-        while i < args.count {
-            let arg = args[i]
-            switch arg {
-            case "--fps":
-                let value = try requireValue(arg)
-                guard let parsed = Int(value), (1...120).contains(parsed) else {
-                    throw CLIError.invalidValue(arg, value)
-                }
-                result.fps = parsed
-
-            case "--ocr-fps":
-                let value = try requireValue(arg)
-                guard let parsed = Double(value), parsed > 0, parsed <= 30 else {
-                    throw CLIError.invalidValue(arg, value)
-                }
-                result.ocrFPS = parsed
-
-            case "--display":
-                let value = try requireValue(arg)
-                guard let parsed = Int(value), parsed >= 0 else {
-                    throw CLIError.invalidValue(arg, value)
-                }
-                result.displayIndex = parsed
-
-            case "--accurate":
-                result.accurateOCR = true
-
-            case "--no-audio":
-                result.captureAudio = false
-
-            case "--change-threshold":
-                let value = try requireValue(arg)
-                guard let parsed = Double(value), parsed >= 0, parsed <= 1 else {
-                    throw CLIError.invalidValue(arg, value)
-                }
-                result.changeThreshold = parsed
-
-            case "--force-ocr-seconds":
-                let value = try requireValue(arg)
-                guard let parsed = Double(value), parsed >= 0.1 else {
-                    throw CLIError.invalidValue(arg, value)
-                }
-                result.forceOCRInterval = parsed
-
-            case "--output":
-                let value = try requireValue(arg)
-                result.outputDirectory = URL(fileURLWithPath: NSString(string: value).expandingTildeInPath)
-
-            case "--help", "-h":
-                print(Self.help)
-                exit(0)
-
-            default:
-                throw CLIError.unknownFlag(arg)
-            }
-            i += 1
-        }
-
-        return result
-    }
-
-    static let help = """
-    SpeedOCR Recorder — synchronized screen video + automatic OCR
-
-    Usage:
-      swift run -c release speedocr [options]
-
-    Options:
-      --fps N                    Video frame rate, 1...120 (default: 60)
-      --ocr-fps N                Maximum OCR samples/second (default: 6)
-      --display N                Display index (default: 0)
-      --accurate                 Prefer OCR accuracy over throughput
-      --no-audio                 Disable system-audio capture
-      --change-threshold N       Visual-change threshold 0...1 (default: 0.018)
-      --force-ocr-seconds N      OCR unchanged screen after N seconds (default: 1.25)
-      --output PATH              Output directory
-      -h, --help                 Show help
-
-    Stop recording with Control-C.
-    """
-}
-
-enum CLIError: LocalizedError {
-    case missingValue(String)
-    case invalidValue(String, String)
-    case unknownFlag(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missingValue(let flag):
-            return "Missing value after \(flag)"
-        case .invalidValue(let flag, let value):
-            return "Invalid value for \(flag): \(value)"
-        case .unknownFlag(let flag):
-            return "Unknown option: \(flag). Use --help."
-        }
-    }
-}
-
-// MARK: - OCR records
-
-struct OCRBox: Codable {
+struct OCRBox: Codable, Identifiable {
+    var id: String { "\(x)_\(y)_\(width)_\(height)_\(text.hashValue)" }
     let text: String
     let confidence: Float
     let x: Double
@@ -142,23 +23,146 @@ struct OCRBox: Codable {
     let height: Double
 }
 
-struct OCREvent: Codable {
+struct OCREvent: Codable, Identifiable {
+    var id: String { "\(elapsedSeconds)_\(text.hashValue)" }
     let elapsedSeconds: Double
     let wallClockISO8601: String
     let framePTSSeconds: Double
     let visualChange: Double
     let text: String
     let boxes: [OCRBox]
+    var passType: String = "live"
+    var detectedRegionsCount: Int = 0
+    var scaleFactor: Double = 1.0
 }
 
-private struct OCRResult {
-    let event: OCREvent
-    let newTranscriptLines: [String]
+struct DiagnosticMetrics: Codable {
+    let totalEvents: Int
+    let totalCharacters: Int
+    let averageRegionsPerFrame: Double
+    let averageScaleFactor: Double
+    let isRecording: Bool
+    let statusMessage: String
+    let currentSessionPath: String
 }
 
-// MARK: - Output writer
+struct RecordingOptions {
+    var fps: Int = 60
+    var ocrFPS: Double = 6.0
+    var displayIndex: Int = 0
+    var accurateOCR: Bool = true
+    var captureAudio: Bool = true
+    var changeThreshold: Double = 0.012
+    var forceOCRInterval: Double = 1.25
+    var region: CGRect? = nil
+    var enableTrajectorySelection: Bool = true
+    var enablePostRecoveryPass: Bool = true
+}
 
-final class SidecarWriter {
+// MARK: - High-DPI Upscaling Engine
+
+final class ImageScaler: @unchecked Sendable {
+    private let context = CIContext(options: [.cacheIntermediates: false])
+
+    func upscaleIfNeeded(_ pixelBuffer: CVPixelBuffer) -> (CVPixelBuffer, Double) {
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+
+        let targetScale: Double
+        if w < 600 || h < 400 {
+            targetScale = 2.5
+        } else if w < 1000 || h < 700 {
+            targetScale = 1.8
+        } else {
+            return (pixelBuffer, 1.0)
+        }
+
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: CGFloat(targetScale), y: CGFloat(targetScale)))
+
+        let newWidth = Int(Double(w) * targetScale)
+        let newHeight = Int(Double(h) * targetScale)
+
+        var newBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            newWidth,
+            newHeight,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true
+            ] as CFDictionary,
+            &newBuffer
+        )
+
+        guard status == kCVReturnSuccess, let outputBuffer = newBuffer else {
+            return (pixelBuffer, 1.0)
+        }
+
+        context.render(scaledImage, to: outputBuffer)
+        return (outputBuffer, targetScale)
+    }
+}
+
+struct UncheckedPixelBuffer: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+}
+
+
+// MARK: - Trajectory Frame Candidate Buffer
+
+final class FrameCandidate: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let pts: CMTime
+    let elapsed: Double
+    let ptsSeconds: Double
+    let wallClock: String
+    let visualChange: Double
+    let sharpnessScore: Double
+
+    init(pixelBuffer: CVPixelBuffer, pts: CMTime, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, sharpnessScore: Double) {
+        self.pixelBuffer = pixelBuffer
+        self.pts = pts
+        self.elapsed = elapsed
+        self.ptsSeconds = ptsSeconds
+        self.wallClock = wallClock
+        self.visualChange = visualChange
+        self.sharpnessScore = sharpnessScore
+    }
+}
+
+final class TrajectoryTracker: @unchecked Sendable {
+    private var candidateBuffer: [FrameCandidate] = []
+    private var isTrackingMotion = false
+    private var previousChange: Double = 0
+
+    func processFrame(candidate: FrameCandidate, threshold: Double) -> FrameCandidate? {
+        let change = candidate.visualChange
+
+        if change >= threshold {
+            candidateBuffer.append(candidate)
+            isTrackingMotion = true
+            previousChange = change
+            if candidateBuffer.count > 10 {
+                candidateBuffer.removeFirst()
+            }
+            return nil
+        } else if isTrackingMotion {
+            isTrackingMotion = false
+            let bestCandidate = candidateBuffer.max(by: { $0.sharpnessScore < $1.sharpnessScore }) ?? candidate
+            candidateBuffer.removeAll()
+            return bestCandidate
+        }
+
+        previousChange = change
+        return nil
+    }
+}
+
+// MARK: - Sidecar File Writer
+
+final class SidecarWriter: @unchecked Sendable {
     private let jsonlHandle: FileHandle
     private let transcriptHandle: FileHandle
     private let srtHandle: FileHandle
@@ -267,9 +271,34 @@ final class SidecarWriter {
     }
 }
 
-// MARK: - Visual-change detector
+// MARK: - Post-Session Recovery & Consensus Processor
 
-final class FrameChangeDetector {
+final class PostSessionProcessor: @unchecked Sendable {
+    func processSession(directory: URL, events: [OCREvent]) {
+        let consensusURL = directory.appendingPathComponent("consensus.txt")
+        var lines: [String] = []
+        var seen = Set<String>()
+
+        for event in events {
+            let split = event.text.split(separator: "\n").map(String.init)
+            for line in split {
+                let clean = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                let norm = clean.lowercased()
+                if !clean.isEmpty && !seen.contains(norm) {
+                    seen.insert(norm)
+                    lines.append(clean)
+                }
+            }
+        }
+
+        let content = lines.joined(separator: "\n") + "\n"
+        try? content.write(to: consensusURL, atomically: true, encoding: .utf8)
+    }
+}
+
+// MARK: - Frame Change Detector
+
+final class FrameChangeDetector: @unchecked Sendable {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let width = 32
     private let height = 18
@@ -317,10 +346,15 @@ final class FrameChangeDetector {
     }
 }
 
-// MARK: - Recorder
+// MARK: - Observable Recorder Service
 
-final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let options: Options
+final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    @Published var isRecording = false
+    @Published var statusMessage = "Ready to record"
+    @Published var liveEvents: [OCREvent] = []
+    @Published var options = RecordingOptions()
+    @Published var currentSessionFolder: URL?
+
     private let captureQueue = DispatchQueue(label: "speedocr.capture", qos: .userInteractive)
     private let ocrQueue = DispatchQueue(label: "speedocr.ocr", qos: .userInitiated)
 
@@ -329,6 +363,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
     private var sidecar: SidecarWriter?
+    private var apiServer: LocalAPIServer?
+    private let postProcessor = PostSessionProcessor()
 
     private var writerStarted = false
     private var firstPTS: CMTime?
@@ -339,96 +375,139 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastAcceptedNormalizedText = ""
 
     private let changeDetector = FrameChangeDetector()
+    private let trajectoryTracker = TrajectoryTracker()
+    private let scaler = ImageScaler()
     private let dateFormatter = ISO8601DateFormatter()
-    private(set) var outputDirectory: URL?
 
-    init(options: Options) {
-        self.options = options
+    override init() {
         super.init()
         dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        apiServer = LocalAPIServer(service: self)
+        apiServer?.start()
     }
 
-    func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard !content.displays.isEmpty else { throw RecorderError.noDisplays }
-        guard content.displays.indices.contains(options.displayIndex) else { throw RecorderError.invalidDisplayIndex(options.displayIndex, content.displays.count) }
+    @MainActor
+    func startRecording() async {
+        guard !isRecording else { return }
 
-        let display = content.displays[options.displayIndex]
-        let width = even(Int(CGDisplayPixelsWide(display.displayID)))
-        let height = even(Int(CGDisplayPixelsHigh(display.displayID)))
+        do {
+            liveEvents.removeAll()
+            writerStarted = false
+            firstPTS = nil
+            lastPTS = .zero
+            lastOCRWallTime = 0
+            lastForcedOCRWallTime = 0
+            ocrInFlight = false
+            lastAcceptedNormalizedText = ""
 
-        let directory = try makeOutputDirectory()
-        outputDirectory = directory
-        sidecar = try SidecarWriter(directory: directory)
-
-        let videoURL = directory.appendingPathComponent("capture.mp4")
-        assetWriter = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
-
-        let bitrate = min(40_000_000, max(8_000_000, Int(Double(width * height * options.fps) * 0.07)))
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoExpectedSourceFrameRateKey: options.fps,
-                AVVideoMaxKeyFrameIntervalKey: options.fps * 2,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-            ]
-        ]
-
-        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        vInput.expectsMediaDataInRealTime = true
-        guard assetWriter?.canAdd(vInput) == true else { throw RecorderError.cannotAddVideoInput }
-        assetWriter?.add(vInput)
-        videoInput = vInput
-
-        if options.captureAudio {
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 48_000,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 192_000
-            ]
-            let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            aInput.expectsMediaDataInRealTime = true
-            if assetWriter?.canAdd(aInput) == true {
-                assetWriter?.add(aInput)
-                audioInput = aInput
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard !content.displays.isEmpty else {
+                statusMessage = "Error: No screen displays found."
+                return
             }
+
+            let display = content.displays[min(options.displayIndex, content.displays.count - 1)]
+            var width = even(Int(CGDisplayPixelsWide(display.displayID)))
+            var height = even(Int(CGDisplayPixelsHigh(display.displayID)))
+
+            if let reg = options.region {
+                width = even(Int(reg.width))
+                height = even(Int(reg.height))
+            }
+
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let folderName = "SpeedOCR-\(formatter.string(from: Date()))"
+            let moviesBase = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies", isDirectory: true)
+            let directory = moviesBase.appendingPathComponent(folderName, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            currentSessionFolder = directory
+
+            sidecar = try SidecarWriter(directory: directory)
+
+            let videoURL = directory.appendingPathComponent("capture.mp4")
+            let writer = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
+
+            let bitrate = min(40_000_000, max(8_000_000, Int(Double(width * height * options.fps) * 0.07)))
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: bitrate,
+                    AVVideoExpectedSourceFrameRateKey: options.fps,
+                    AVVideoMaxKeyFrameIntervalKey: options.fps * 2,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+
+            let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            vInput.expectsMediaDataInRealTime = true
+            guard writer.canAdd(vInput) else {
+                statusMessage = "Error: Could not configure video output."
+                return
+            }
+            writer.add(vInput)
+            videoInput = vInput
+
+            if options.captureAudio {
+                let audioSettings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2,
+                    AVEncoderBitRateKey: 192_000
+                ]
+                let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                aInput.expectsMediaDataInRealTime = true
+                if writer.canAdd(aInput) {
+                    writer.add(aInput)
+                    audioInput = aInput
+                }
+            }
+
+            assetWriter = writer
+
+            let configuration = SCStreamConfiguration()
+            configuration.width = width
+            configuration.height = height
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(options.fps))
+            configuration.queueDepth = 8
+            configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            configuration.showsCursor = true
+            configuration.capturesAudio = options.captureAudio
+            configuration.sampleRate = 48_000
+            configuration.channelCount = 2
+
+            if let region = options.region {
+                configuration.sourceRect = region
+            }
+
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            let scStream = SCStream(filter: filter, configuration: configuration, delegate: self)
+            try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+            if options.captureAudio {
+                try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
+            }
+            self.stream = scStream
+            try await scStream.startCapture()
+
+            isRecording = true
+            statusMessage = "Recording active (\(width)x\(height) @ \(options.fps)fps)"
+        } catch {
+            statusMessage = "Recording failed: \(error.localizedDescription)"
         }
-
-        let configuration = SCStreamConfiguration()
-        configuration.width = width
-        configuration.height = height
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(options.fps))
-        configuration.queueDepth = 8
-        configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.showsCursor = true
-        configuration.capturesAudio = options.captureAudio
-        configuration.sampleRate = 48_000
-        configuration.channelCount = 2
-
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        if options.captureAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
-        }
-        self.stream = stream
-        try await stream.startCapture()
-
-        print("Recording display \(options.displayIndex) at \(width)x\(height), \(options.fps) fps")
-        print("OCR: up to \(options.ocrFPS) samples/sec, \(options.accurateOCR ? "accurate" : "fast") mode")
-        print("Output: \(directory.path)")
-        print("Press Control-C to stop.")
     }
 
-    func stop() async {
-        if let stream {
-            do { try await stream.stopCapture() } catch { fputs("Capture stop warning: \(error.localizedDescription)\n", stderr) }
+    @MainActor
+    func stopRecording() async {
+        guard isRecording else { return }
+        statusMessage = "Finalizing session..."
+
+        if let stream = self.stream {
+            try? await stream.stopCapture()
         }
-        await withCheckedContinuation { continuation in
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             captureQueue.async {
                 self.videoInput?.markAsFinished()
                 self.audioInput?.markAsFinished()
@@ -436,127 +515,202 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 let finalElapsed: Double
                 if let firstPTS = self.firstPTS {
                     finalElapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(self.lastPTS, firstPTS)))
-                } else { finalElapsed = 0 }
+                } else {
+                    finalElapsed = 0
+                }
 
-                do { try self.sidecar?.finish(finalElapsed: finalElapsed) } catch { fputs("Sidecar close warning: \(error.localizedDescription)\n", stderr) }
+                try? self.sidecar?.finish(finalElapsed: finalElapsed)
 
-                guard let writer = self.assetWriter, self.writerStarted else { continuation.resume(); return }
+                if let dir = self.currentSessionFolder {
+                    self.postProcessor.processSession(directory: dir, events: self.liveEvents)
+                }
+
+                guard let writer = self.assetWriter, self.writerStarted else {
+                    continuation.resume()
+                    return
+                }
+
                 writer.finishWriting {
-                    if writer.status == .failed { fputs("Video writer failed: \(writer.error?.localizedDescription ?? "unknown error")\n", stderr) }
                     continuation.resume()
                 }
             }
         }
 
-        if let outputDirectory {
-            print("\nFinished.")
-            print("Video:      \(outputDirectory.appendingPathComponent("capture.mp4").path)")
-            print("OCR events: \(outputDirectory.appendingPathComponent("ocr.jsonl").path)")
-            print("Transcript: \(outputDirectory.appendingPathComponent("transcript.txt").path)")
-            print("Captions:   \(outputDirectory.appendingPathComponent("ocr.srt").path)")
+        isRecording = false
+        if let folder = currentSessionFolder {
+            statusMessage = "Saved to: \(folder.lastPathComponent)"
+        } else {
+            statusMessage = "Recording stopped."
         }
     }
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) { fputs("ScreenCaptureKit stopped: \(error.localizedDescription)\n", stderr) }
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+    nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         guard sampleBuffer.isValid else { return }
         switch outputType {
-        case .screen: processVideo(sampleBuffer)
-        case .audio: processAudio(sampleBuffer)
-        @unknown default: break
+        case .screen:
+            processVideo(sampleBuffer)
+        case .audio:
+            processAudio(sampleBuffer)
+        default:
+            break
         }
     }
 
-    private func processVideo(_ sampleBuffer: CMSampleBuffer) {
+    nonisolated private func processVideo(_ sampleBuffer: CMSampleBuffer) {
         guard isCompleteFrame(sampleBuffer) else { return }
         let pts = sampleBuffer.presentationTimeStamp
-        lastPTS = pts
+        self.lastPTS = pts
+
         if !writerStarted {
-            guard let writer = assetWriter, writer.startWriting() else { fputs("Unable to start video writer: \(assetWriter?.error?.localizedDescription ?? "unknown")\n", stderr); return }
+            guard let writer = assetWriter, writer.startWriting() else { return }
             writer.startSession(atSourceTime: pts)
             writerStarted = true
             firstPTS = pts
         }
+
         if videoInput?.isReadyForMoreMediaData == true {
-            if videoInput?.append(sampleBuffer) == false {
-                fputs("Dropped video sample: \(assetWriter?.error?.localizedDescription ?? "append failed")\n", stderr)
-            }
+            videoInput?.append(sampleBuffer)
         }
+
         guard let pixelBuffer = sampleBuffer.imageBuffer, let firstPTS else { return }
         let now = CFAbsoluteTimeGetCurrent()
         let minInterval = 1.0 / options.ocrFPS
         guard !ocrInFlight, now - lastOCRWallTime >= minInterval else { return }
+
         let change = changeDetector.difference(for: pixelBuffer)
         let force = now - lastForcedOCRWallTime >= options.forceOCRInterval
-        guard force || change >= options.changeThreshold else { return }
-        lastOCRWallTime = now
-        if force { lastForcedOCRWallTime = now }
-        ocrInFlight = true
+
         let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(pts, firstPTS)))
         let ptsSeconds = CMTimeGetSeconds(pts)
         let wallClock = dateFormatter.string(from: Date())
-        let retainedPixelBuffer = pixelBuffer
+
+        let candidate = FrameCandidate(pixelBuffer: pixelBuffer, pts: pts, elapsed: elapsed, ptsSeconds: ptsSeconds, wallClock: wallClock, visualChange: change, sharpnessScore: change)
+
+        let selectedCandidate: FrameCandidate?
+        if options.enableTrajectorySelection && !force {
+            selectedCandidate = trajectoryTracker.processFrame(candidate: candidate, threshold: options.changeThreshold)
+        } else {
+            selectedCandidate = (force || change >= options.changeThreshold) ? candidate : nil
+        }
+
+        guard let targetFrame = selectedCandidate else { return }
+
+        lastOCRWallTime = now
+        if force { lastForcedOCRWallTime = now }
+        ocrInFlight = true
+
+        let (scaledBuffer, scaleFactor) = scaler.upscaleIfNeeded(targetFrame.pixelBuffer)
+
+        let frameElapsed = targetFrame.elapsed
+        let framePTS = targetFrame.ptsSeconds
+        let frameClock = targetFrame.wallClock
+        let frameChange = targetFrame.visualChange
+
+        let sendableBuffer = UncheckedPixelBuffer(buffer: scaledBuffer)
         ocrQueue.async {
-            let event = self.recognize(pixelBuffer: retainedPixelBuffer, elapsed: elapsed, ptsSeconds: ptsSeconds, wallClock: wallClock, visualChange: change)
+            let event = self.recognizeHighRecall(pixelBuffer: sendableBuffer.buffer, elapsed: frameElapsed, ptsSeconds: framePTS, wallClock: frameClock, visualChange: frameChange, scaleFactor: scaleFactor)
+
+
             self.captureQueue.async {
                 defer { self.ocrInFlight = false }
                 guard let event else { return }
+
                 let normalized = self.normalizeBlock(event.text)
                 guard !normalized.isEmpty else { return }
+
                 let similarity = self.tokenJaccard(normalized, self.lastAcceptedNormalizedText)
                 guard similarity < 0.97 else { return }
+
                 self.lastAcceptedNormalizedText = normalized
-                do { try self.sidecar?.write(event) } catch { fputs("OCR sidecar write failed: \(error.localizedDescription)\n", stderr) }
+                try? self.sidecar?.write(event)
+
+                Task { @MainActor in
+                    self.liveEvents.append(event)
+                }
             }
         }
     }
 
-    private func processAudio(_ sampleBuffer: CMSampleBuffer) {
+    nonisolated private func processAudio(_ sampleBuffer: CMSampleBuffer) {
         guard writerStarted, audioInput?.isReadyForMoreMediaData == true else { return }
-        if audioInput?.append(sampleBuffer) == false {
-            fputs("Dropped audio sample: \(assetWriter?.error?.localizedDescription ?? "append failed")\n", stderr)
-        }
+        audioInput?.append(sampleBuffer)
     }
 
-    private func recognize(pixelBuffer: CVPixelBuffer, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double) -> OCREvent? {
+    nonisolated private func recognizeHighRecall(pixelBuffer: CVPixelBuffer, elapsed: Double, ptsSeconds: Double, wallClock: String, visualChange: Double, scaleFactor: Double) -> OCREvent? {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = options.accurateOCR ? .accurate : .fast
-        request.usesLanguageCorrection = options.accurateOCR
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
         request.automaticallyDetectsLanguage = true
-        request.minimumTextHeight = 0.006
+        request.minimumTextHeight = 0.001
+
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do { try handler.perform([request]) } catch { fputs("OCR failed: \(error.localizedDescription)\n", stderr); return nil }
-        let observations = (request.results ?? []).sorted { lhs, rhs in
-            let yDelta = lhs.boundingBox.midY - rhs.boundingBox.midY
-            if abs(yDelta) > 0.015 { return lhs.boundingBox.midY > rhs.boundingBox.midY }
-            return lhs.boundingBox.minX < rhs.boundingBox.minX
+        do {
+            try handler.perform([request])
+        } catch {
+            return nil
         }
-        var boxes: [OCRBox] = []
-        for observation in observations {
+
+        guard let results = request.results, !results.isEmpty else { return nil }
+
+        var rawBoxes: [(obs: VNRecognizedTextObservation, text: String, conf: Float)] = []
+        for observation in results {
             guard let candidate = observation.topCandidates(1).first else { continue }
             let clean = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { continue }
-            boxes.append(OCRBox(text: clean, confidence: candidate.confidence, x: observation.boundingBox.origin.x, y: observation.boundingBox.origin.y, width: observation.boundingBox.size.width, height: observation.boundingBox.size.height))
+            rawBoxes.append((observation, clean, candidate.confidence))
         }
-        guard !boxes.isEmpty else { return nil }
-        let text = boxes.map { $0.text }.joined(separator: "\n")
-        return OCREvent(elapsedSeconds: elapsed, wallClockISO8601: wallClock, framePTSSeconds: ptsSeconds, visualChange: visualChange, text: text, boxes: boxes)
+
+        guard !rawBoxes.isEmpty else { return nil }
+
+        let sortedObs = rawBoxes.sorted { lhs, rhs in
+            let yDelta = lhs.obs.boundingBox.midY - rhs.obs.boundingBox.midY
+            if abs(yDelta) > 0.02 { return lhs.obs.boundingBox.midY > rhs.obs.boundingBox.midY }
+            return lhs.obs.boundingBox.minX < rhs.obs.boundingBox.minX
+        }
+
+        var boxes: [OCRBox] = []
+        for item in sortedObs {
+            let obs = item.obs
+            boxes.append(OCRBox(
+                text: item.text,
+                confidence: item.conf,
+                x: Double(obs.boundingBox.origin.x),
+                y: Double(obs.boundingBox.origin.y),
+                width: Double(obs.boundingBox.size.width),
+                height: Double(obs.boundingBox.size.height)
+            ))
+        }
+
+        let fullText = boxes.map { $0.text }.joined(separator: "\n")
+        return OCREvent(
+            elapsedSeconds: elapsed,
+            wallClockISO8601: wallClock,
+            framePTSSeconds: ptsSeconds,
+            visualChange: visualChange,
+            text: fullText,
+            boxes: boxes,
+            passType: "accurate-high-recall",
+            detectedRegionsCount: boxes.count,
+            scaleFactor: scaleFactor
+        )
     }
 
-    private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let first = attachments.first, let rawStatus = first[.status] as? Int, let status = SCFrameStatus(rawValue: rawStatus) else { return true }
+    nonisolated private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let first = attachments.first,
+              let rawStatus = first[.status] as? Int,
+              let status = SCFrameStatus(rawValue: rawStatus) else { return true }
         return status == .complete
     }
 
-    private func normalizeBlock(_ text: String) -> String {
+    nonisolated private func normalizeBlock(_ text: String) -> String {
         text.lowercased()
             .replacingOccurrences(of: #"\\s+"#, with: " ", options: .regularExpression)
             .replacingOccurrences(of: #"[^\\p{L}\\p{N} ]"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func tokenJaccard(_ a: String, _ b: String) -> Double {
+    nonisolated private func tokenJaccard(_ a: String, _ b: String) -> Double {
         guard !a.isEmpty, !b.isEmpty else { return 0 }
         let left = Set(a.split(separator: " ").map(String.init))
         let right = Set(b.split(separator: " ").map(String.init))
@@ -565,68 +719,553 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         return Double(left.intersection(right).count) / Double(union.count)
     }
 
-    private func makeOutputDirectory() throws -> URL {
-        if let out = options.outputDirectory {
-            try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-            return out
-        }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let folder = "SpeedOCR-\(formatter.string(from: Date()))"
-        let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies", isDirectory: true)
-        let directory = base.appendingPathComponent(folder, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
-    }
-
-    private func even(_ value: Int) -> Int { max(2, value - (value % 2)) }
+    private func even(_ val: Int) -> Int { max(2, val - (val % 2)) }
 }
 
-enum RecorderError: LocalizedError {
-    case noDisplays
-    case invalidDisplayIndex(Int, Int)
-    case cannotAddVideoInput
-    var errorDescription: String? {
-        switch self {
-        case .noDisplays: return "No capturable display was found."
-        case .invalidDisplayIndex(let requested, let count): return "Display index \(requested) is invalid; \(count) display(s) are available."
-        case .cannotAddVideoInput: return "AVAssetWriter rejected the video input."
+// MARK: - Local HTTP API Server
+
+final class LocalAPIServer: @unchecked Sendable {
+    private var listener: NWListener?
+    private unowned let service: RecorderService
+
+    init(service: RecorderService) {
+        self.service = service
+    }
+
+    func start(port: UInt16 = 8080) {
+        do {
+            let params = NWParameters.tcp
+            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            listener?.newConnectionHandler = { [weak self] connection in
+                self?.handleConnection(connection)
+            }
+            listener?.start(queue: .global(qos: .userInitiated))
+        } catch {}
+    }
+
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: .global(qos: .userInitiated))
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
+            guard let self, let data, let request = String(data: data, encoding: .utf8) else { connection.cancel(); return }
+
+            let lines = request.split(separator: "\r\n")
+            let firstLine = lines.first ?? ""
+            let parts = firstLine.split(separator: " ")
+            let method = parts.first ?? "GET"
+            let path = parts.dropFirst().first ?? "/"
+
+            var bodyJSON = "{}"
+            var contentType = "application/json"
+
+            if method == "POST" && path == "/api/control/start" {
+                Task { @MainActor in
+                    await self.service.startRecording()
+                }
+                bodyJSON = "{\"status\":\"starting\",\"isRecording\":true}"
+            } else if method == "POST" && path == "/api/control/stop" {
+                Task { @MainActor in
+                    await self.service.stopRecording()
+                }
+                bodyJSON = "{\"status\":\"stopping\",\"isRecording\":false}"
+            } else if path.hasPrefix("/api/transcript") {
+                contentType = "text/plain; charset=utf-8"
+                let allText = self.service.liveEvents.map { $0.text }.joined(separator: "\n\n")
+                bodyJSON = allText
+            } else if path.hasPrefix("/api/srt") {
+                contentType = "text/plain; charset=utf-8"
+                var srtLines: [String] = []
+                for (idx, e) in self.service.liveEvents.enumerated() {
+                    srtLines.append("\(idx + 1)\n00:00:\(Int(e.elapsedSeconds)),000 --> 00:00:\(Int(e.elapsedSeconds) + 2),000\n\(e.text)\n")
+                }
+                bodyJSON = srtLines.joined(separator: "\n")
+            } else if path.hasPrefix("/api/search") {
+                let query = path.split(separator: "?").dropFirst().first?.replacingOccurrences(of: "q=", with: "").lowercased() ?? ""
+                let matches = self.service.liveEvents.filter { $0.text.lowercased().contains(query) }
+                if let jsonData = try? JSONEncoder().encode(matches), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/diagnostics") {
+                let totalChars = self.service.liveEvents.reduce(0) { $0 + $1.text.count }
+                let avgRegions = self.service.liveEvents.isEmpty ? 0 : Double(self.service.liveEvents.reduce(0) { $0 + $1.detectedRegionsCount }) / Double(self.service.liveEvents.count)
+                let avgScale = self.service.liveEvents.isEmpty ? 1.0 : Double(self.service.liveEvents.reduce(0.0) { $0 + $1.scaleFactor }) / Double(self.service.liveEvents.count)
+
+                let diag = DiagnosticMetrics(
+                    totalEvents: self.service.liveEvents.count,
+                    totalCharacters: totalChars,
+                    averageRegionsPerFrame: avgRegions,
+                    averageScaleFactor: avgScale,
+                    isRecording: self.service.isRecording,
+                    statusMessage: self.service.statusMessage,
+                    currentSessionPath: self.service.currentSessionFolder?.path ?? ""
+                )
+                if let jsonData = try? JSONEncoder().encode(diag), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/status") {
+                let status: [String: Any] = [
+                    "app": "SpeedOCR Studio",
+                    "status": self.service.statusMessage,
+                    "isRecording": self.service.isRecording,
+                    "fps": self.service.options.fps,
+                    "eventCount": self.service.liveEvents.count,
+                    "trajectorySelection": self.service.options.enableTrajectorySelection
+                ]
+                if let jsonData = try? JSONSerialization.data(withJSONObject: status), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/events") {
+                if let jsonData = try? JSONEncoder().encode(self.service.liveEvents), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            } else if path.hasPrefix("/api/latest") {
+                if let last = self.service.liveEvents.last, let jsonData = try? JSONEncoder().encode(last), let jsonStr = String(data: jsonData, encoding: .utf8) {
+                    bodyJSON = jsonStr
+                }
+            }
+
+            let response = """
+            HTTP/1.1 200 OK\r
+            Content-Type: \(contentType)\r
+            Access-Control-Allow-Origin: *\r
+            Access-Control-Allow-Headers: *\r
+            Content-Length: \(bodyJSON.utf8.count)\r
+            Connection: close\r
+            \r
+            \(bodyJSON)
+            """
+
+            connection.send(content: Data(response.utf8), completion: .contentProcessed({ _ in
+                connection.cancel()
+            }))
         }
     }
 }
 
-// MARK: - Main
+// MARK: - Screen Lasso Window & Overlay
+
+final class LassoOverlayWindow: NSWindow {
+    private var onSelection: ((CGRect) -> Void)?
+
+    init(onSelection: @escaping (CGRect) -> Void) {
+        self.onSelection = onSelection
+
+        let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        super.init(contentRect: screenFrame, styleMask: [.borderless], backing: .buffered, defer: false)
+
+        self.backgroundColor = .clear
+        self.isOpaque = false
+        self.hasShadow = false
+        self.level = .screenSaver
+        self.ignoresMouseEvents = false
+
+        let view = LassoView(frame: screenFrame) { [weak self] selectedRect in
+            self?.orderOut(nil)
+            onSelection(selectedRect)
+        }
+        self.contentView = view
+    }
+}
+
+final class LassoView: NSView {
+    private var startPoint: CGPoint?
+    private var currentPoint: CGPoint?
+    private var onComplete: (CGRect) -> Void
+
+    init(frame: NSRect, onComplete: @escaping (CGRect) -> Void) {
+        self.onComplete = onComplete
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        startPoint = convert(event.locationInWindow, from: nil)
+        currentPoint = startPoint
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        currentPoint = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        currentPoint = convert(event.locationInWindow, from: nil)
+        if let start = startPoint, let current = currentPoint {
+            let rect = CGRect(
+                x: min(start.x, current.x),
+                y: min(start.y, current.y),
+                width: abs(current.x - start.x),
+                height: abs(current.y - start.y)
+            )
+
+            let screenHeight = bounds.height
+            let flippedY = screenHeight - rect.maxY
+            let displayRect = CGRect(x: rect.origin.x, y: flippedY, width: rect.width, height: rect.height)
+
+            if rect.width > 20 && rect.height > 20 {
+                onComplete(displayRect)
+            }
+        }
+        startPoint = nil
+        currentPoint = nil
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.withAlphaComponent(0.35).set()
+        dirtyRect.fill()
+
+        if let start = startPoint, let current = currentPoint {
+            let rect = CGRect(
+                x: min(start.x, current.x),
+                y: min(start.y, current.y),
+                width: abs(current.x - start.x),
+                height: abs(current.y - start.y)
+            )
+
+            NSColor.clear.set()
+            rect.fill(using: .copy)
+
+            let path = NSBezierPath(rect: rect)
+            path.lineWidth = 2.0
+            NSColor.systemBlue.setStroke()
+            path.stroke()
+
+            let text = "\(Int(rect.width)) × \(Int(rect.height))"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.white,
+                .backgroundColor: NSColor.systemBlue
+            ]
+            let attrString = NSAttributedString(string: " \(text) ", attributes: attrs)
+            attrString.draw(at: CGPoint(x: rect.origin.x, y: max(0, rect.origin.y - 20)))
+        }
+    }
+}
+
+// MARK: - SwiftUI Dashboard UI
+
+struct SpeedOCRDashboard: View {
+    @StateObject private var recorder = RecorderService()
+    @State private var lassoWindow: LassoOverlayWindow?
+    @State private var copiedBanner = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header / Controls Bar
+            HStack(spacing: 16) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(recorder.isRecording ? Color.red : Color.green)
+                        .frame(width: 10, height: 10)
+                        .scaleEffect(recorder.isRecording ? 1.2 : 1.0)
+
+                    Text(recorder.isRecording ? "RECORDING" : "READY")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(recorder.isRecording ? .red : .secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+
+                Button(action: {
+                    Task {
+                        if recorder.isRecording {
+                            await recorder.stopRecording()
+                        } else {
+                            await recorder.startRecording()
+                        }
+                    }
+                }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: recorder.isRecording ? "square.fill" : "record.circle.fill")
+                            .font(.system(size: 16, weight: .bold))
+                        Text(recorder.isRecording ? "Stop Recording" : "Start Recording")
+                            .font(.system(size: 14, weight: .bold))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(recorder.isRecording ? Color.red : Color.accentColor)
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: triggerLasso) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "crop")
+                        if let reg = recorder.options.region {
+                            Text("\(Int(reg.width))×\(Int(reg.height))")
+                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        } else {
+                            Text("Select Region (Lasso)")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.2)))
+                }
+                .buttonStyle(.plain)
+                .disabled(recorder.isRecording)
+
+                if recorder.options.region != nil {
+                    Button(action: { recorder.options.region = nil }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                Toggle(isOn: $recorder.options.enableTrajectorySelection) {
+                    Label("High-Recall Mode", systemImage: "text.viewfinder")
+                        .font(.system(size: 12))
+                }
+                .toggleStyle(.checkbox)
+                .disabled(recorder.isRecording)
+
+                Toggle(isOn: $recorder.options.captureAudio) {
+                    Label("Audio", systemImage: recorder.options.captureAudio ? "mic.fill" : "mic.slash")
+                        .font(.system(size: 12))
+                }
+                .toggleStyle(.checkbox)
+                .disabled(recorder.isRecording)
+
+                Toggle(isOn: $recorder.options.accurateOCR) {
+                    Label("Accurate", systemImage: "sparkles")
+                        .font(.system(size: 12))
+                }
+                .toggleStyle(.checkbox)
+                .disabled(recorder.isRecording)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(Color(NSColor.windowBackgroundColor))
+
+            Divider()
+
+            // Status message strip
+            HStack {
+                Text(recorder.statusMessage)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                Text("⚡ Local API: http://127.0.0.1:8080/api/events")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.7))
+
+                if copiedBanner {
+                    Text("✓ Copied to clipboard!")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.green)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.02))
+
+            Divider()
+
+            // Main Content Area & Quick Copy Toolbar
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("QUICK COPY:")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.secondary)
+
+                    Button("📋 Copy All Text") {
+                        copyToClipboard(allText)
+                    }
+
+                    Button("📑 Copy Clean List") {
+                        copyToClipboard(cleanTextLines)
+                    }
+
+                    Button("⏱️ Copy Latest") {
+                        if let last = recorder.liveEvents.last {
+                            copyToClipboard(last.text)
+                        }
+                    }
+
+                    Spacer()
+
+                    if let folder = recorder.currentSessionFolder {
+                        Button("📂 Open Folder") {
+                            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path)
+                        }
+                    }
+                }
+                .font(.system(size: 12, weight: .medium))
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
+                .background(Color.primary.opacity(0.04))
+
+                Divider()
+
+                if recorder.liveEvents.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "text.viewfinder")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary.opacity(0.5))
+                        Text("No text recorded yet")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.secondary)
+                        Text("Click 'Start Recording' and text on screen will automatically transcribe here in real-time.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 360)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 10) {
+                                ForEach(recorder.liveEvents) { event in
+                                    OCREventRow(event: event) { text in
+                                        copyToClipboard(text)
+                                    }
+                                    .id(event.id)
+                                }
+                            }
+                            .padding(16)
+                        }
+                        .onChange(of: recorder.liveEvents.count) {
+                            if let last = recorder.liveEvents.last {
+                                withAnimation {
+                                    proxy.scrollTo(last.id, anchor: .bottom)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 800, minHeight: 520)
+    }
+
+    private var allText: String {
+        recorder.liveEvents.map { "[\(formatTime($0.elapsedSeconds))]\n\($0.text)" }.joined(separator: "\n\n")
+    }
+
+    private var cleanTextLines: String {
+        var set = Set<String>()
+        var result: [String] = []
+        for e in recorder.liveEvents {
+            let lines = e.text.split(separator: "\n").map(String.init)
+            for line in lines {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && !set.contains(trimmed.lowercased()) {
+                    set.insert(trimmed.lowercased())
+                    result.append(trimmed)
+                }
+            }
+        }
+        return result.joined(separator: "\n")
+    }
+
+    private func copyToClipboard(_ text: String) {
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        withAnimation { copiedBanner = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            withAnimation { copiedBanner = false }
+        }
+    }
+
+    private func triggerLasso() {
+        let win = LassoOverlayWindow { selectedRect in
+            recorder.options.region = selectedRect
+            recorder.statusMessage = "Selected lasso region: \(Int(selectedRect.width))×\(Int(selectedRect.height))"
+        }
+        lassoWindow = win
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let total = Int(seconds)
+        let m = total / 60
+        let s = total % 60
+        let ms = Int((seconds - Double(total)) * 10)
+        return String(format: "%02d:%02d.%d", m, s, ms)
+    }
+}
+
+struct OCREventRow: View {
+    let event: OCREvent
+    let onCopy: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(formatTime(event.elapsedSeconds))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.15))
+                    .foregroundColor(.accentColor)
+                    .cornerRadius(4)
+
+                Text(event.wallClockISO8601)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+
+                if event.scaleFactor > 1.0 {
+                    Text("\(String(format: "%.1fx", event.scaleFactor)) Upscaled")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.2))
+                        .foregroundColor(.purple)
+                        .cornerRadius(3)
+                }
+
+                Spacer()
+
+                Button(action: { onCopy(event.text) }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc")
+                        Text("Copy")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(event.text)
+                .font(.system(size: 13, design: .default))
+                .foregroundColor(.primary)
+                .textSelection(.enabled)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.08)))
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let total = Int(seconds)
+        let m = total / 60
+        let s = total % 60
+        let ms = Int((seconds - Double(total)) * 10)
+        return String(format: "%02d:%02d.%d", m, s, ms)
+    }
+}
+
+// MARK: - Native App Entrypoint
 
 @main
-struct SpeedOCRRecorderMain {
-    static func main() async {
-        do {
-            let options = try Options.parse(Array(CommandLine.arguments.dropFirst()))
-            let recorder = Recorder(options: options)
-            try await recorder.start()
-            let stopped = DispatchSemaphore(value: 0)
-            signal(SIGINT, SIG_IGN)
-            signal(SIGTERM, SIG_IGN)
-            let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global(qos: .userInitiated))
-            let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global(qos: .userInitiated))
-            let stopOnce = NSLock()
-            var stopping = false
-            let stopHandler = {
-                stopOnce.lock()
-                if stopping { stopOnce.unlock(); return }
-                stopping = true
-                stopOnce.unlock()
-                Task { await recorder.stop(); stopped.signal() }
-            }
-            sigint.setEventHandler(handler: stopHandler)
-            sigterm.setEventHandler(handler: stopHandler)
-            sigint.resume()
-            sigterm.resume()
-            stopped.wait()
-        } catch {
-            fputs("Error: \(error.localizedDescription)\n\n", stderr)
-            fputs(Options.help + "\n", stderr)
-            exit(1)
+struct SpeedOCRApp: App {
+    var body: some Scene {
+        WindowGroup("SpeedOCR Studio — Screen & Text Recorder") {
+            SpeedOCRDashboard()
         }
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
     }
 }
