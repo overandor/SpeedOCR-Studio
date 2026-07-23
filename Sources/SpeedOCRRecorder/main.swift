@@ -34,7 +34,12 @@ struct OCREvent: Codable, Identifiable {
     var passType: String = "live"
     var detectedRegionsCount: Int = 0
     var scaleFactor: Double = 1.0
+    var originApp: String = "Active Workspace"
+    var appCategory: String = "Development & Logic"
+    var clusterCategory: String = "Code / Logic"
+    var optimalTimeScore: Double = 0.98
 }
+
 
 struct DiagnosticMetrics: Codable {
     let totalEvents: Int
@@ -681,6 +686,9 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
             ))
         }
 
+        let appMeta = AppClusterFilterEngine.shared.detectFrontmostApp()
+        let timeScore = AppClusterFilterEngine.shared.computeOptimalTimeScore()
+
         let fullText = boxes.map { $0.text }.joined(separator: "\n")
         return OCREvent(
             elapsedSeconds: elapsed,
@@ -691,9 +699,51 @@ final class RecorderService: NSObject, ObservableObject, SCStreamOutput, SCStrea
             boxes: boxes,
             passType: "accurate-high-recall",
             detectedRegionsCount: boxes.count,
-            scaleFactor: scaleFactor
+            scaleFactor: scaleFactor,
+            originApp: appMeta.name,
+            appCategory: appMeta.category,
+            clusterCategory: appMeta.cluster,
+            optimalTimeScore: timeScore
         )
     }
+
+final class AppClusterFilterEngine: @unchecked Sendable {
+    static let shared = AppClusterFilterEngine()
+
+    func detectFrontmostApp() -> (name: String, category: String, cluster: String) {
+        let app = NSWorkspace.shared.frontmostApplication
+        let name = app?.localizedName ?? "Active Workspace"
+        let bundle = app?.bundleIdentifier?.lowercased() ?? ""
+
+        let category: String
+        let cluster: String
+        if bundle.contains("xcode") || bundle.contains("terminal") || bundle.contains("cursor") || bundle.contains("vscode") {
+            category = "Development & Engineering"
+            cluster = "Code & Terminal Commands"
+        } else if bundle.contains("safari") || bundle.contains("chrome") || bundle.contains("firefox") {
+            category = "Browser & Web Harvester"
+            cluster = "Web Content & Documentation"
+        } else if bundle.contains("slack") || bundle.contains("telegram") || bundle.contains("discord") || bundle.contains("messages") {
+            category = "Team Communication"
+            cluster = "Chat & Sync Threads"
+        } else if bundle.contains("notion") || bundle.contains("notes") || bundle.contains("pages") {
+            category = "Documentation & Specs"
+            cluster = "Notes & Architectural Specs"
+        } else {
+            category = "General Productivity"
+            cluster = "Desktop Application Stream"
+        }
+        return (name, category, cluster)
+    }
+
+    func computeOptimalTimeScore() -> Double {
+        let hour = Calendar.current.component(.hour, from: Date())
+        if (9...12).contains(hour) { return 1.0 }
+        if (14...18).contains(hour) { return 0.95 }
+        return 0.82
+    }
+}
+
 
     nonisolated private func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
