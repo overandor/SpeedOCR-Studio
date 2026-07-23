@@ -35,7 +35,18 @@
 1. Run `./build_app.command` (or open `SpeedOCR Studio.app`).
 2. Double-click `SpeedOCR Studio.app` to open the GUI Dashboard.
 
+### 🛡️ Troubleshooting macOS Gatekeeper ("App is damaged and can't be opened")
+Because files downloaded from the web carry macOS quarantine extended attributes, run this one-liner command in Terminal to bypass Gatekeeper:
+```bash
+xattr -cr "SpeedOCR Studio.app"
+```
+Or if moved to `/Applications`:
+```bash
+sudo xattr -rd com.apple.quarantine "/Applications/SpeedOCR Studio.app"
+```
+
 ### Option 2: Run via Terminal
 ```bash
 ./run.command
 ```
+

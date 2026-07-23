@@ -51,5 +51,9 @@ EOF
 chmod +x "$MACOS_DIR/speedocr"
 chmod +x "$DIR/run.command"
 
-echo "✅ App bundle created at: $APP_DIR"
+codesign --force --deep --sign - "$APP_DIR"
+xattr -cr "$APP_DIR"
+
+echo "✅ App bundle created & ad-hoc signed at: $APP_DIR"
 echo "🚀 You can launch it by running: open '$APP_DIR'"
+
